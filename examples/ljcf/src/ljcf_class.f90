@@ -7,6 +7,8 @@ module ljcf_class
    use surfmesh_class,    only: surfmesh
    use hypre_str_class,   only: hypre_str
    !use ddadi_class,       only: ddadi
+   use fft3d_class,       only: fft3d
+   use stracker_class,    only: stracker
    use vfs_class,         only: vfs
    use tpns_class,        only: tpns
    use timetracker_class, only: timetracker
@@ -28,25 +30,31 @@ module ljcf_class
       type(config) :: cfg
       
       !> Flow solver
-      type(vfs)         :: vf    !< Volume fraction solver
+      type(vfs)        ,public :: vf    !< Volume fraction solver
       type(tpns)        :: fs    !< Two-phase flow solver
       type(hypre_str)   :: ps    !< Structured Hypre linear solver for pressure
       !type(ddadi)       :: vs    !< DDADI solver for velocity
       type(timetracker) :: time  !< Time info
       type(cclabel)     :: ccl   !< CCLabel for local Weber number calculation
-      
+
+      !> Include structure tracker
+      type(stracker) :: strack
+
       !> Ensight postprocessing
       type(surfmesh) :: smesh    !< Surface mesh for interface
       type(ensight)  :: ens_out  !< Ensight output for flow variables
-      type(event)    :: ens_evt  !< Event trigger for Ensight output
+      type(event)    :: ens_evt, drop_evt  !< Event trigger for Ensight output
       
       !> Simulation monitor file
       type(monitor) :: mfile    !< General simulation monitoring
       type(monitor) :: cflfile  !< CFL monitoring
+      type(monitor) :: hitfile  !< added these lines from stracker
+      type(monitor) :: cvgfile 
       
       !> Work arrays
       real(WP), dimension(:,:,:), allocatable :: resU,resV,resW      !< Residuals
       real(WP), dimension(:,:,:), allocatable :: Ui,Vi,Wi            !< Cell-centered velocities
+      real(WP), dimension(:,:,:,:,:), allocatable :: gradU
       
       !> Iterator for VOF removal
       type(iterator) :: vof_removal_layer  !< Edge of domain where we actively remove VOF
@@ -77,9 +85,299 @@ module ljcf_class
       procedure :: final    !< Finalize nozzle simulation
    end type ljcf
    
+   !> Type for structure stats
+   type :: struct_stats
+      real(WP) :: vol
+      real(WP) :: x_cg,y_cg,z_cg
+      real(WP) :: u_avg,v_avg,w_avg
+      real(WP), dimension(3,3) :: Imom
+      real(WP), dimension(3) :: lengths
+      real(WP), dimension(3,3) :: axes
+   end type struct_stats
    
 contains
+
    
+
+   
+
+   !> Perform droplet analysis
+   subroutine analyse_drops(this)
+      use mpi_f08,   only: MPI_ALLREDUCE,MPI_SUM,MPI_IN_PLACE
+      use parallel,  only: MPI_REAL_WP
+      use mathtools, only: Pi
+      use string,    only: str_medium
+      use filesys,   only: makedir,isdir
+      class(ljcf), intent(inout) :: this
+      character(len=str_medium) :: filename,timestamp
+      real(WP), dimension(:), allocatable :: dvol
+      integer :: iunit,n,m,ierr
+      ! Allocate droplet volume array
+      allocate(dvol(1:this%strack%nstruct)); dvol=0.0_WP
+      ! Loop over individual structures
+      do n=1,this%strack%nstruct
+         ! Loop over cells in structure and accumulate volume
+         do m=1,this%strack%struct(n)%n_
+            dvol(n)=dvol(n)+this%cfg%vol(this%strack%struct(n)%map(1,m),this%strack%struct(n)%map(2,m),this%strack%struct(n)%map(3,m))*&
+            &                 this%vf%VF(this%strack%struct(n)%map(1,m),this%strack%struct(n)%map(2,m),this%strack%struct(n)%map(3,m))
+         end do
+      end do
+      ! Reduce volume data
+      call MPI_ALLREDUCE(MPI_IN_PLACE,dvol,this%strack%nstruct,MPI_REAL_WP,MPI_SUM,this%vf%cfg%comm,ierr)
+      ! Only root process outputs to a file
+      if (this%cfg%amRoot) then
+         if (.not.isdir('diameter')) call makedir('diameter')
+         filename='diameter_'; write(timestamp,'(es12.5)') this%time%t
+         open(newunit=iunit,file='diameter/'//trim(adjustl(filename))//trim(adjustl(timestamp)),form='formatted',status='replace',access='stream',iostat=ierr)
+         do n=1,this%strack%nstruct
+            ! Output list of diameters
+            write(iunit,'(999999(es12.5,x))') (6.0_WP*dvol(n)/Pi)**(1.0_WP/3.0_WP)
+         end do
+         close(iunit)
+      end if
+   end subroutine analyse_drops
+
+      !> Perform merge/split analysis
+   subroutine analyze_merge_split(this)
+      use mpi_f08,  only: MPI_ALLREDUCE,MPI_SUM,MPI_IN_PLACE
+      use parallel, only: MPI_REAL_WP
+      implicit none
+      class(ljcf), intent(inout) :: this
+      integer :: iunit
+      logical :: file_exists
+      type(struct_stats) :: stats
+
+      ! Open the file - Created in simulation_init
+      if (this%cfg%amRoot) open(iunit,file="merge_split.csv",form="formatted",status="old",position="append",action="write")
+   
+      analyze_merges: block
+         integer :: n,nn
+
+         ! Traverse merge events
+         do n=1,this%strack%nmerge_master
+
+            call compute_struct_stats(this%strack%merge_master(n)%newid,stats)
+            if (this%cfg%amRoot) then 
+               ! Write merge data to file
+               this%strack%eventcount = this%strack%eventcount+1
+               write(iunit,"(I0)",      advance="no")  this%strack%eventcount
+               write(iunit,"(A)",       advance="no")  ', Merge,'
+               do nn=1,this%strack%merge_master(n)%noldid
+                  write(iunit,"(I0)",   advance="no")  this%strack%merge_master(n)%oldids(nn)
+                  write(iunit,"(A)",    advance="no")  ';'
+               end do
+               write(iunit,"(A)",       advance="no")   ','
+               write(iunit,"(I0)",      advance="no")  this%strack%merge_master(n)%newid
+               write(iunit,"(A)",       advance="no")  ','
+               write(iunit,"(ES12.5 )", advance="no")  this%time%t
+               write(iunit,"(A)",       advance="no")   ','
+               write(iunit,"(ES22.16)", advance="yes") stats%vol
+            end if 
+         end do
+      end block analyze_merges
+
+      analyze_splits: block 
+      integer :: n,nn
+
+         ! Traverse split events
+         do n=1,this%strack%nsplit_master
+            ! Write stats for each new structure after split
+            do nn=1,this%strack%split_master(n)%nnewid
+               call compute_struct_stats(this%strack%split_master(n)%newids(nn),stats)
+               if (this%cfg%amRoot) then 
+
+                  ! Write merge data to file
+                  this%strack%eventcount = this%strack%eventcount+1
+                  write(iunit,"(I0)",      advance="no")  this%strack%eventcount
+                  write(iunit,"(A)",       advance="no")  ', Split,'
+                  write(iunit,"(I0)",      advance="no")  this%strack%split_master(n)%oldid
+                  write(iunit,"(A)",       advance="no")  ','
+                  write(iunit,"(I0)",      advance="no")  this%strack%split_master(n)%newids(nn)
+                  write(iunit,"(A)",       advance="no")  ','
+                  write(iunit,"(ES12.5 )", advance="no")  this%time%t
+                  write(iunit,"(A)",       advance="no")  ','
+                  write(iunit,"(ES22.16)", advance="no")  stats%vol
+                  write(iunit,"(A)",       advance="no")  ','
+                  write(iunit,"(ES20.12)", advance="no")  stats%x_cg
+                  write(iunit,"(A)",       advance="no")  ','
+                  write(iunit,"(ES20.12)", advance="no")  stats%y_cg
+                  write(iunit,"(A)",       advance="no")  ','
+                  write(iunit,"(ES20.12)", advance="no")  stats%z_cg
+                  write(iunit,"(A)",       advance="no")  ','
+                  write(iunit,"(ES20.12)", advance="no")  stats%u_avg
+                  write(iunit,"(A)",       advance="no")  ','
+                  write(iunit,"(ES20.12)", advance="no")  stats%v_avg
+                  write(iunit,"(A)",       advance="no")  ','
+                  write(iunit,"(ES20.12)", advance="no")  stats%w_avg
+                  write(iunit,"(A)",       advance="no")  ','
+                  write(iunit,"(ES20.12)", advance="no")  stats%lengths(1)
+                  write(iunit,"(A)",       advance="no")  ','
+                  write(iunit,"(ES20.12)", advance="no")  stats%lengths(2)
+                  write(iunit,"(A)",       advance="no")  ','
+                  write(iunit,"(ES20.12)", advance="yes")  stats%lengths(3)
+               end if 
+            end do
+         end do
+      
+      end block analyze_splits
+
+      if (this%cfg%amRoot) close(iunit)
+   
+      contains 
+      subroutine compute_struct_stats(id,stats)
+         implicit none 
+         integer, intent(in) :: id
+         type(struct_stats), intent(inout) :: stats
+
+         integer :: n,m
+         integer :: lwork,info,ierr
+         integer :: ii,jj,kk
+         integer  :: per_x,per_y,per_z
+         real(WP) :: vol_struct
+         real(WP) :: x_vol,y_vol,z_vol
+         real(WP) :: u_vol,v_vol,w_vol
+         real(WP), dimension(3,3) :: Imom
+         real(WP) :: xtmp,ytmp,ztmp
+         real(WP), dimension(3) :: lengths
+         real(WP), dimension(3,3) :: axes
+         
+         ! Eigenvalues/eigenvectors
+         real(WP), dimension(3,3) :: A
+         real(WP), dimension(3) :: d
+         integer , parameter :: order = 3
+         real(WP), dimension(:), allocatable :: work
+         real(WP), dimension(1)   :: lwork_query
+
+         
+         ! Query optimal work array size
+         call dsyev('V','U',order,A,order,d,lwork_query,-1,info); lwork=int(lwork_query(1)); allocate(work(lwork))
+
+         ! Initialize values
+         vol_struct    = 0.0_WP ! Structure volume
+         x_vol = 0.0_WP; y_vol = 0.0_WP; z_vol = 0.0_WP ! Center of gravity
+         u_vol = 0.0_WP; v_vol = 0.0_WP; w_vol = 0.0_WP ! Average velocity inside struct
+
+         ! Find new structure with matching newid
+         do n=1,this%strack%nstruct
+            ! Only deal with structure matching newid
+            if (this%strack%struct(n)%id.eq.id) then
+               
+               ! Periodicity
+               per_x = this%strack%struct(n)%per(1)
+               per_y = this%strack%struct(n)%per(2)
+               per_z = this%strack%struct(n)%per(3)
+               
+               ! Loop over cells in new structure and accumulate statistics
+               do m=1,this%strack%struct(n)%n_
+
+                  ! Indices of cells in structure
+                  ii=this%strack%struct(n)%map(1,m) 
+                  jj=this%strack%struct(n)%map(2,m) 
+                  kk=this%strack%struct(n)%map(3,m)
+
+                  ! Location of struct node
+                  xtmp = this%strack%vf%cfg%xm(ii)-per_x*this%strack%vf%cfg%xL
+                  ytmp = this%strack%vf%cfg%ym(jj)-per_y*this%strack%vf%cfg%yL
+                  ztmp = this%strack%vf%cfg%zm(kk)-per_z*this%strack%vf%cfg%zL
+
+                  ! Volume
+                  vol_struct = vol_struct + this%strack%vf%cfg%vol(ii,jj,kk)*this%strack%vf%VF(ii,jj,kk)
+                  
+                  ! Center of gravity
+                  x_vol = x_vol + xtmp*this%strack%vf%cfg%vol(ii,jj,kk)*this%strack%vf%VF(ii,jj,kk)
+                  y_vol = y_vol + ytmp*this%strack%vf%cfg%vol(ii,jj,kk)*this%strack%vf%VF(ii,jj,kk)
+                  z_vol = z_vol + ztmp*this%strack%vf%cfg%vol(ii,jj,kk)*this%strack%vf%VF(ii,jj,kk)
+                  
+                  ! Average velocity inside struct
+                  u_vol = u_vol + this%fs%U(ii,jj,kk)*this%strack%vf%cfg%vol(ii,jj,kk)*this%strack%vf%VF(ii,jj,kk)
+                  v_vol = v_vol + this%fs%V(ii,jj,kk)*this%strack%vf%cfg%vol(ii,jj,kk)*this%strack%vf%VF(ii,jj,kk)
+                  w_vol = w_vol + this%fs%W(ii,jj,kk)*this%strack%vf%cfg%vol(ii,jj,kk)*this%strack%vf%VF(ii,jj,kk)
+               end do
+            end if
+         end do
+
+         ! Sum parallel stats
+         call MPI_ALLREDUCE(MPI_IN_PLACE,vol_struct,1,MPI_REAL_WP,MPI_SUM,this%strack%vf%cfg%comm,ierr)
+         call MPI_ALLREDUCE(MPI_IN_PLACE,x_vol,1,MPI_REAL_WP,MPI_SUM,this%strack%vf%cfg%comm,ierr)
+         call MPI_ALLREDUCE(MPI_IN_PLACE,y_vol,1,MPI_REAL_WP,MPI_SUM,this%strack%vf%cfg%comm,ierr)
+         call MPI_ALLREDUCE(MPI_IN_PLACE,z_vol,1,MPI_REAL_WP,MPI_SUM,this%strack%vf%cfg%comm,ierr)
+         call MPI_ALLREDUCE(MPI_IN_PLACE,u_vol,1,MPI_REAL_WP,MPI_SUM,this%strack%vf%cfg%comm,ierr)
+         call MPI_ALLREDUCE(MPI_IN_PLACE,v_vol,1,MPI_REAL_WP,MPI_SUM,this%strack%vf%cfg%comm,ierr)
+         call MPI_ALLREDUCE(MPI_IN_PLACE,w_vol,1,MPI_REAL_WP,MPI_SUM,this%strack%vf%cfg%comm,ierr)
+         
+         ! Moments of inertia
+         Imom=0.0_WP
+         do n=1,this%strack%nstruct
+            ! Only deal with structure matching newid
+            if (this%strack%struct(n)%id.eq.id) then
+
+               ! Periodicity
+               per_x = this%strack%struct(n)%per(1)
+               per_y = this%strack%struct(n)%per(2)
+               per_z = this%strack%struct(n)%per(3)
+                  
+               ! Loop over cells in new structure and accumulate statistics
+               do m=1,this%strack%struct(n)%n_
+
+                  ! Indices of cells in structure
+                  ii=this%strack%struct(n)%map(1,m) 
+                  jj=this%strack%struct(n)%map(2,m) 
+                  kk=this%strack%struct(n)%map(3,m)
+
+                  ! Location of struct node
+                  xtmp = this%strack%vf%cfg%xm(ii)-per_x*this%strack%vf%cfg%xL-x_vol/vol_struct
+                  ytmp = this%strack%vf%cfg%ym(jj)-per_y*this%strack%vf%cfg%yL-y_vol/vol_struct
+                  ztmp = this%strack%vf%cfg%zm(kk)-per_z*this%strack%vf%cfg%zL-z_vol/vol_struct
+
+                  ! Moment of Inertia
+                  Imom(1,1) = Imom(1,1) + (ytmp**2 + ztmp**2)*this%strack%vf%cfg%vol(ii,jj,kk)*this%strack%vf%VF(ii,jj,kk)
+                  Imom(2,2) = Imom(2,2) + (xtmp**2 + ztmp**2)*this%strack%vf%cfg%vol(ii,jj,kk)*this%strack%vf%VF(ii,jj,kk)
+                  Imom(3,3) = Imom(3,3) + (xtmp**2 + ytmp**2)*this%strack%vf%cfg%vol(ii,jj,kk)*this%strack%vf%VF(ii,jj,kk)
+                  
+                  Imom(1,2) = Imom(1,2) - xtmp*ytmp*this%strack%vf%cfg%vol(ii,jj,kk)*this%strack%vf%VF(ii,jj,kk)
+                  Imom(1,3) = Imom(1,3) - xtmp*ztmp*this%strack%vf%cfg%vol(ii,jj,kk)*this%strack%vf%VF(ii,jj,kk)
+                  Imom(2,3) = Imom(2,3) - ytmp*ztmp*this%strack%vf%cfg%vol(ii,jj,kk)*this%strack%vf%VF(ii,jj,kk)
+               end do 
+            end if
+         end do
+
+         ! Sum parallel stats on Imom
+         do n=1,3
+            call MPI_ALLREDUCE(MPI_IN_PLACE,Imom(:,n),3,MPI_REAL_WP,MPI_SUM,this%strack%vf%cfg%comm,ierr)
+         end do
+
+         ! Characteristic lengths and principle axes
+         ! Eigenvalues/eigenvectors of moments of inertia tensor
+         A = Imom
+         n = 3
+         call dsyev('V','U',n,Imom,n,d,work,lwork,info)
+         ! Get rid of very small negative values (due to machine accuracy)
+         d = max(0.0_WP,d)
+         ! Store characteristic lengths
+         lengths(1) = sqrt(5.0_WP/2.0_WP*abs(d(2)+d(3)-d(1))/vol_struct)
+         lengths(2) = sqrt(5.0_WP/2.0_WP*abs(d(3)+d(1)-d(2))/vol_struct)
+         lengths(3) = sqrt(5.0_WP/2.0_WP*abs(d(1)+d(2)-d(3))/vol_struct)
+         ! Zero out length in 3rd dimension if 2D
+         if (this%strack%vf%cfg%nx.eq.1.or.this%strack%vf%cfg%ny.eq.1.or.this%strack%vf%cfg%nz.eq.1) lengths(3)=0.0_WP
+         ! Store principal axes
+         axes(:,:) = A
+
+         ! Finish computing quantities
+         stats%vol     = vol_struct
+         stats%x_cg    = x_vol/vol_struct
+         stats%y_cg    = y_vol/vol_struct
+         stats%z_cg    = z_vol/vol_struct
+         stats%u_avg   = u_vol/vol_struct
+         stats%v_avg   = v_vol/vol_struct
+         stats%w_avg   = w_vol/vol_struct
+         stats%Imom    = Imom 
+         stats%lengths = lengths
+         stats%axes    = axes
+
+      end subroutine compute_struct_stats
+
+   end subroutine analyze_merge_split
+
    !> Initialization of ljcf simulation
    subroutine init(this)
       implicit none
@@ -139,6 +437,7 @@ contains
          allocate(this%Ui  (this%cfg%imino_:this%cfg%imaxo_,this%cfg%jmino_:this%cfg%jmaxo_,this%cfg%kmino_:this%cfg%kmaxo_))
          allocate(this%Vi  (this%cfg%imino_:this%cfg%imaxo_,this%cfg%jmino_:this%cfg%jmaxo_,this%cfg%kmino_:this%cfg%kmaxo_))
          allocate(this%Wi  (this%cfg%imino_:this%cfg%imaxo_,this%cfg%jmino_:this%cfg%jmaxo_,this%cfg%kmino_:this%cfg%kmaxo_))
+         allocate(this%gradU(1:3,1:3,this%cfg%imino_:this%cfg%imaxo_,this%cfg%jmino_:this%cfg%jmaxo_,this%cfg%kmino_:this%cfg%kmaxo_))
       end block allocate_work_arrays
 
       ! Set up walls before solvers are initialized
@@ -168,19 +467,22 @@ contains
             
       ! Initialize our VOF solver and field
       create_and_initialize_vof: block
-         use vfs_class, only: remap,VFlo,VFhi,plicnet,r2pnet
+         use vfs_class, only: remap_storage,VFlo,VFhi,plicnet,r2pnet
          use mms_geom,  only: cube_refine_vol
          use param,     only: param_read
-         integer :: i,j,k,n,si,sj,sk
+         use MPI, only: MPI_INTEGER,MPI_MAX
+         integer :: i,j,k,n,si,sj,sk,ierr
          real(WP), dimension(3,8) :: cube_vertex
          real(WP), dimension(3) :: v_cent,a_cent
          real(WP) :: vol,area
          integer, parameter :: amr_ref_lvl=4
          ! Create a VOF solver
-         call this%vf%initialize(cfg=this%cfg,reconstruction_method=r2pnet,transport_method=remap,name='VOF')
+         call this%vf%initialize(cfg=this%cfg,reconstruction_method=r2pnet,transport_method=remap_storage,name='VOF')
          this%vf%thin_thld_min=0.0_WP
          this%vf%flotsam_thld=0.0_WP
          this%vf%maxcurv_times_mesh=1.0_WP
+         ! Create structure tracker
+         call this%strack%initialize(vf=this%vf,phase=0,make_label=label_liquid,name='stracker_test')
          ! Initialize the interface to a ljcf
          do k=this%vf%cfg%kmino_,this%vf%cfg%kmaxo_
             do j=this%vf%cfg%jmino_,this%vf%cfg%jmaxo_
@@ -209,9 +511,17 @@ contains
                      this%vf%Lbary(:,i,j,k)=[this%vf%cfg%xm(i),this%vf%cfg%ym(j),this%vf%cfg%zm(k)]
                      this%vf%Gbary(:,i,j,k)=[this%vf%cfg%xm(i),this%vf%cfg%ym(j),this%vf%cfg%zm(k)]
                   end if
+                   ! Set stracker id
+                     if (vol.gt.0.0_WP) then
+                        this%strack%id(i,j,k)=1
+                     end if
                end do
             end do
          end do
+
+         ! Initialize id counter to be consistent with id's
+         this%strack%idcount=maxval(this%strack%id)
+         call MPI_ALLREDUCE(maxval(this%strack%id),this%strack%idcount,1,MPI_INTEGER,MPI_MAX,this%cfg%comm,ierr)
          ! Update the band
          call this%vf%update_band()
          ! Perform interface reconstruction from VOF field
@@ -425,9 +735,10 @@ contains
       create_smesh: block
          use irl_fortran_interface, only: getNumberOfPlanes,getNumberOfVertices
          integer :: i,j,k,np,nplane
-         this%smesh=surfmesh(nvar=2,name='plic')
+         this%smesh=surfmesh(nvar=3,name='plic')
          this%smesh%varname(1)='nplane'
          this%smesh%varname(2)='thickness'
+         this%smesh%varname(3)='id'
          ! Transfer polygons to smesh
          call this%vf%update_surfmesh(this%smesh)
          ! Calculate thickness
@@ -442,7 +753,7 @@ contains
                   do nplane=1,getNumberOfPlanes(this%vf%liquid_gas_interface(i,j,k))
                      if (getNumberOfVertices(this%vf%interface_polygon(nplane,i,j,k)).gt.0) then
                         np=np+1; this%smesh%var(1,np)=real(getNumberOfPlanes(this%vf%liquid_gas_interface(i,j,k)),WP)
-                        this%smesh%var(2,np)=this%vf%thickness(i,j,k)
+                        this%smesh%var(2,np)=this%vf%thickness(i,j,k); this%smesh%var(3,np)=real(this%strack%id(i,j,k),WP)
                      end if
                   end do
                end do
@@ -465,6 +776,7 @@ contains
          call this%ens_out%add_scalar('curvature',this%vf%curv)
          call this%ens_out%add_scalar('pressure',this%fs%P)
          call this%ens_out%add_surface('plic',this%smesh)
+         call this%ens_out%add_scalar('id',this%strack%id)
          ! Output to ensight
          if (this%ens_evt%occurs()) call this%ens_out%write_data(this%time%t)
       end block create_ensight
@@ -527,6 +839,29 @@ contains
          call this%timefile%add_column(this%tvel%time  ,trim(this%tvel%name))
          call this%timefile%add_column(this%tpres%time ,trim(this%tpres%name))
       end block create_timing
+
+      create_merge_split: block 
+         integer :: iunit
+         logical :: file_exists
+         if (this%cfg%amRoot) then
+            ! Check if the file exists
+            INQUIRE(FILE="merge_split.csv", EXIST=file_exists)
+            if (.not.file_exists) then
+               ! Create a new file with headers if it doesn't exist
+               open(newunit=iunit, file="merge_split.csv", form="formatted", status="replace", action="write")
+               write(iunit, "(A)") "Event Count, Event Type, Old IDs, New ID, Time, New Vol, X, Y, Z, U, V, W, L1, L2, L3"
+               close(iunit)
+            end if
+         end if
+      end block create_merge_split
+
+      ! Initialize an event for drop size analysis
+      drop_analysis: block
+         use param, only: param_read
+         this%drop_evt=event(time=this%time,name='Drop analysis')
+         call param_read('Drop analysis period',this%drop_evt%tper)
+         if (this%drop_evt%occurs()) call analyse_drops(this)
+      end block drop_analysis
       
    contains
       
@@ -610,6 +945,16 @@ contains
          if (j.eq.pg%jmin.and.jet(pg,i,j,k)) isIn=.true.
       end function jet_bdy
       
+      !> Function that identifies liquid cells
+      logical function label_liquid(i,j,k)
+         implicit none
+         integer, intent(in) :: i,j,k
+         if (this%vf%VF(i,j,k).gt.0.0_WP) then
+            label_liquid=.true.
+         else
+            label_liquid=.false.
+         end if
+      end function label_liquid
 
    end subroutine init
    
@@ -664,6 +1009,10 @@ contains
       call this%tvof%start() ! Start VOF timer
       call this%vf%advance(dt=this%time%dt,U=this%fs%U,V=this%fs%V,W=this%fs%W)
       call this%tvof%stop() ! Stop VOF timer
+
+      ! Advance stracker
+      call this%strack%advance(make_label=label_liquid)
+      call analyze_merge_split(this)
       
       ! Prepare new sflaggered viscosity (at n+1)
       call this%fs%get_viscosity(vf=this%vf,strat=arithmetic_visc)
@@ -773,7 +1122,7 @@ contains
                      do nplane=1,getNumberOfPlanes(this%vf%liquid_gas_interface(i,j,k))
                         if (getNumberOfVertices(this%vf%interface_polygon(nplane,i,j,k)).gt.0) then
                            np=np+1; this%smesh%var(1,np)=real(getNumberOfPlanes(this%vf%liquid_gas_interface(i,j,k)),WP)
-                           this%smesh%var(2,np)=this%vf%thickness(i,j,k)
+                           this%smesh%var(2,np)=this%vf%thickness(i,j,k); this%smesh%var(3,np)=real(this%strack%id(i,j,k),WP)
                         end if
                      end do
                   end do
@@ -785,6 +1134,9 @@ contains
       
       ! Stop timestep timer
       call this%tstep%stop()
+
+      ! Analyse droplets
+         if (this%drop_evt%occurs()) call analyse_drops(this)
       
       ! Perform and output monitoring
       call this%fs%get_max()
@@ -850,6 +1202,19 @@ contains
             deallocate(P11,P12,P13,P14,P21,P22,P23,P24)
          end block save_restart
       end if
+
+   contains
+
+      !> Function that identifies liquid cells
+      logical function label_liquid(i,j,k)
+         implicit none
+         integer, intent(in) :: i,j,k
+         if (this%vf%VF(i,j,k).gt.0.0_WP) then
+            label_liquid=.true.
+         else
+            label_liquid=.false.
+         end if
+      end function label_liquid
       
    end subroutine step
    

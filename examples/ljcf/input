@@ -1,5 +1,5 @@
 # Parallelization
-Partition :	1 1 1
+Partition :	6 1 1
 I/O partition : 1 1 1
 
 # Mesh definition
@@ -35,6 +35,7 @@ Pressure iteration : 100
 # Data output
 Ensight output period : 1
 Restart output period : 1
+Drop analysis period : 2.5e-1
 
 # Data restart
 #Restart from : 1.00000E+01
