@@ -1,6 +1,6 @@
 !> Definition for a ljcf atomization class
 module ljcf_class
-   use precision,         only: WP
+   use precision,         only: WP,SP
    use config_class,      only: config
    use iterator_class,    only: iterator
    use ensight_class,     only: ensight
@@ -18,11 +18,16 @@ module ljcf_class
    use pardata_class,     only: pardata
    use cclabel_class,     only: cclabel
    use irl_fortran_interface
+   use interface_smoothing, only: marching_cubes2
+
    implicit none
    private
    
    public :: ljcf
    
+   ! For SILO_10.2, use f9x
+   include "silo_f9x.inc"
+
    !> ljcf object
    type :: ljcf
       
@@ -49,7 +54,7 @@ module ljcf_class
       type(monitor) :: mfile    !< General simulation monitoring
       type(monitor) :: cflfile  !< CFL monitoring
       type(monitor) :: hitfile  !< added these lines from stracker
-      type(monitor) :: cvgfile 
+      type(monitor) :: cvgfile   
       
       !> Work arrays
       real(WP), dimension(:,:,:), allocatable :: resU,resV,resW      !< Residuals
@@ -96,10 +101,6 @@ module ljcf_class
    end type struct_stats
    
 contains
-
-   
-
-   
 
    !> Perform droplet analysis
    subroutine analyse_drops(this)
@@ -172,8 +173,15 @@ contains
                write(iunit,"(ES12.5 )", advance="no")  this%time%t
                write(iunit,"(A)",       advance="no")   ','
                write(iunit,"(ES22.16)", advance="yes") stats%vol
+               ! write SILO files for merge events
             end if 
+            if (this%strack%merge_master(n)%newid.ne.1) then ! not liquid core
+               !print*, "Dumping GTDA for merge event, newid=", this%strack%merge_master(n)%newid
+               call dump_gtda(this,this%strack%merge_master(n)%newid,1)
+            end if
+            !call silo_lists_update(1)
          end do
+         !call timing_stop('merge_split')
       end block analyze_merges
 
       analyze_splits: block 
@@ -216,6 +224,12 @@ contains
                   write(iunit,"(A)",       advance="no")  ','
                   write(iunit,"(ES20.12)", advance="yes")  stats%lengths(3)
                end if 
+               if (this%strack%split_master(n)%newids(nn).ne.1) then ! not liquid core
+                  !print*, "Dumping GTDA for split event, newid=", this%strack%split_master(n)%newids(nn)
+                  call dump_gtda(this,this%strack%split_master(n)%newids(nn),2)
+                  !print*, "Done dumping GTDA for split event, newid=", this%strack%split_master(n)%newids(nn)
+               end if
+               !call silo_lists_update(2)
             end do
          end do
       
@@ -224,6 +238,7 @@ contains
       if (this%cfg%amRoot) close(iunit)
    
       contains 
+
       subroutine compute_struct_stats(id,stats)
          implicit none 
          integer, intent(in) :: id
@@ -378,11 +393,454 @@ contains
 
    end subroutine analyze_merge_split
 
+   subroutine dump_gtda(this,id,silo_case)
+      !use dump_merge_split
+      !use dump_struct
+      !use dump_visit
+      !use multiphase_fluxes
+      !use interface_smoothing
+      use stracker_class,    only: stracker
+      use vfs_class,         only: vfs,VFlo
+      use mpi_f08, only: MPI_INTEGER,MPI_LOGICAL,MPI_LOR,MPI_REAL
+      use messager, only: die
+      use interface_smoothing
+      implicit none
+
+      class(ljcf), intent(inout) :: this
+
+      integer, intent(in) :: id
+      integer :: i,j,k,ii,jj,kk
+      integer :: c,cc,ntet,n,nn,nnn,np,nd,dim,ntri
+      integer :: case,case2,v1,v2
+      integer :: nAllocated,nListAllocated
+      integer :: root = 0
+      integer,  dimension(:), allocatable :: tmpNodeList
+      integer,  dimension(:,:), allocatable :: tmpZoneIndex
+      real(SP), dimension(:), allocatable :: tmpNode
+      !real(WP), parameter :: VOFlo_visit=0.00001
+      !real(WP), parameter :: VOFhi_visit=0.99999
+      real(WP), dimension(3,8) :: verts
+      real(WP), dimension(3,5) :: tverts,tverts2
+      real(WP), dimension(3,4) :: mytet
+      real(WP), dimension(4) :: d,plane
+      real(WP), dimension(3) :: node,cen
+      real(WP) :: mu
+      real(WP) :: sdx2,sdy2,sdz2  
+
+      integer, intent(in) :: silo_case
+      integer, dimension(this%cfg%nproc) :: g_nStruct_array,displace,g_nMerge_array,displace_nodelist,displace_zonelist,g_nNode_array,g_nZone_array,g_nodeList_array
+      real(SP),  dimension(:), allocatable :: g_xNode,g_yNode,g_zNode
+      integer, dimension(:), allocatable :: g_nodeList
+      integer :: g_nNodes,g_nZones
+      real(SP), dimension(:), allocatable :: Vnorm,g_Vnorm
+      logical  :: include_proc, g_include_proc,dir_exists
+      integer :: dbfile,err,ierr,optlist,stop_
+      character(len=5) :: dirname
+      character(len=43) :: siloname
+      character(len=26) :: folder,buffer
+      real(SP), dimension(:), allocatable :: ind
+      integer  :: ms_nout_time
+      integer :: nZoneAllocated
+   
+      
+
+
+      !call timing_start('gtda') 
+
+      ! Initialize SILO LID and time lists if they do not exist yet
+      !if (is_gtda .and. .not. LID_silo_exists .and. this%cfg%amRoot) then
+      !   allocate(LID_silo(this%strack%nstruct)); LID_silo = this%strack%id_rmp
+      !   allocate(time_silo(this%strack%nstruct)); time_silo = this%time%t
+
+      !   nAlloc_silo = this%strack%nstruct
+      !   LID_silo_exists = .true.
+      !end if 
+
+      ! Loop over split/merge/update structures
+      do np=1,this%strack%nstruct
+         ! Initialize stop flag
+         !stop_ = 0
+
+         ! start marching thru list, starting at first_struct
+         !my_struct => first_struct
+         !do m=1,this%strack%struct(np)
+         ! Initialize arrays
+         nAllocated    =1000
+         nListAllocated=1000
+         allocate(xNode   (nAllocated)); xNode = 0
+         allocate(yNode   (nAllocated)); yNode = 0
+         allocate(zNode   (nAllocated)); zNode = 0
+         allocate(Vnorm   (nAllocated)); Vnorm = 0
+         allocate(nodeList(nListAllocated)); nodeList = 0
+         ! Allocate buffers for interface variables
+         if (.not.allocated(zoneIndex)) then
+            !print*, "Allocating zoneIndex for the first time"
+            !call die("stopping")
+            nZoneAllocated=1000
+            allocate(zoneIndex(3,nZoneAllocated))
+         else
+            nZoneAllocated = size(zoneIndex,2)
+         end if
+         nNodes=0
+         nZones=0
+
+         ! Logical initialize = false
+         include_proc = .false.
+         !do while(associated(this%strack%struct(np)).and.stop_.eq.0)
+            !print*, "Processor ", this%cfg%rank, " checking structure ", np, " with id ", this%strack%struct(np)%id
+            !print*, "Other id" , id
+            if (this%strack%struct(np)%id.eq.id) then
+               ! Include these processors in MPI calls below
+               include_proc = .true.
+               
+               ! Loop over nodes in struct
+               do nd=1,this%strack%struct(np)%n_ 
+               i = this%strack%struct(np)%map(1,nd)
+               j = this%strack%struct(np)%map(2,nd)
+               k = this%strack%struct(np)%map(3,nd)
+               
+               ! Output the interface using default or marching cubes
+               !select case(trim(gtda_output_type))
+               
+               !case('Marching cubes')
+                  if (this%vf%VF(i,j,k).ge.VFlo) then 
+                     ! Must loop over all surrounding cells for marching cubes
+                     do kk = k-1,k+1
+                        do jj = j-1,j+1
+                           do ii = i-1,i+1
+                              ! Call marching_cubes
+                              !print*, "cell", ii, jj, kk
+                              !print*, "nZoneAllocated: ", nZoneAllocated, "nZones: ", nZones
+                              call marching_cubes2(this%vf,ii,jj,kk)
+                              !print*, "Marching cubes called for cell "
+                              !if (nZoneAllocated.gt.1000) then
+                              !   call die("stopping after marching cubes for testing")
+                              !end if
+                              ! Reallocate arrays if necessary
+                              if (nAllocated-nNodes.lt.200) then
+                                 allocate(tmpNode(nAllocated))
+                                 tmpNode=xNode; deallocate(xNode); allocate(xNode(nAllocated+1000)); xNode(1:nAllocated)=tmpNode
+                                 tmpNode=yNode; deallocate(yNode); allocate(yNode(nAllocated+1000)); yNode(1:nAllocated)=tmpNode
+                                 tmpNode=zNode; deallocate(zNode); allocate(zNode(nAllocated+1000)); zNode(1:nAllocated)=tmpNode
+                                 tmpNode=Vnorm; deallocate(Vnorm); allocate(Vnorm(nAllocated+1000)); Vnorm(1:nAllocated)=tmpNode
+                                 deallocate(tmpNode)
+                                 nAllocated=nAllocated+1000
+                              end if
+                              if (nListAllocated-3*nZones.lt.200) then
+                                 allocate(tmpNodeList(nListAllocated))
+                                 tmpNodeList=nodeList; 
+                                 deallocate(nodeList); 
+                                 allocate(nodeList(nListAllocated+1000)); 
+                                 nodeList(1:nListAllocated)=tmpNodeList
+                                 deallocate(tmpNodeList)
+                                 nListAllocated=nListAllocated+1000
+                              end if
+                              if (nZoneAllocated-nZones.lt.200) then
+                                 allocate(tmpZoneIndex(3,nZoneallocated))
+                                 tmpZoneIndex=zoneIndex
+                                 deallocate(zoneIndex)
+                                 allocate(zoneIndex(3,nZoneAllocated+1000))
+                                 Zoneindex(:,1:nZoneAllocated)=tmpZoneIndex
+                                 deallocate(tmpZoneIndex)
+                                 nZoneAllocated=nZoneAllocated+1000
+                              end if
+                           end do 
+                        end do 
+                     end do 
+
+                  end if ! VOF.ge.VOFlo_Visit
+               !end select 
+               end do ! i,j,k
+               ! Exit loop over structures
+               !stop_ = 1
+               !print*, "Number of nodes after looping through i,j,k", nNodes
+            end if
+         ! Go to next structure
+         !end do
+         !my_struct => my_struct%next
+         !end do ! do while associated(my_struct)
+
+         ! Create global logical - if any processors have split structures, then true
+         call MPI_ALLREDUCE(include_proc,g_include_proc,1,MPI_LOGICAL,MPI_LOR,this%cfg%comm,ierr)
+
+         ! ! Add a zero-area tri if this proc doesn't have one
+         ! if (nZones.eq.0) then
+         !    nZones=1
+         !    nNodes=3
+         !    xNode(1:3)=real(xm(imin_),SP)
+         !    yNode(1:3)=real(ym(jmin_),SP)
+         !    zNode(1:3)=real(zm(kmin_),SP)
+         !    nodeList(1:3)=(/1,2,3/)
+         !    zoneIndex(:,nZones)=(/ imin_,jmin_,kmin_ /)
+         ! end if 
+         !print*, "Number of zones after marching cubes", nZones
+         ! Calculate normal velocity on each zone
+         do n = 1,nZones
+            !do c = 1,8
+            i = zoneIndex(1,n)
+            j = zoneIndex(2,n)
+            k = zoneIndex(3,n)
+            plane = getPlane(this%vf%liquid_gas_interface(i,j,k),0)
+            Vnorm(i) = real(this%fs%U(i,j,k)*plane(1) &
+                        + this%fs%V(i,j,k)*plane(2) &
+                        + this%fs%W(i,j,k)*plane(3),SP)
+            !end do
+         end do 
+         !print*, "Normal velocities calculated for ", nZones, " zones"
+         !print*, "Number of nodes on proc ", this%cfg%rank, " is ", nNodes
+         ! ---------------------- !
+         ! Gather lists onto root !
+         ! ---------------------- !
+         if (g_include_proc) then
+
+            ! Initialize arrays
+            g_nNode_array=0
+            g_nodeList_array=0
+            g_nZone_array=0
+            
+            ! Communicate nNodes
+            call MPI_AllGather(nNodes,1,MPI_INTEGER,g_nNode_array,1,MPI_INTEGER,this%cfg%comm,ierr)
+            g_nNodes=sum(g_nNode_array)
+
+            !print*, "print off global nNodes"  
+            !print*, g_nNodes 
+         
+            ! Communicate nZones
+            call MPI_AllGather(nZones,1,MPI_INTEGER,g_nZone_array,1,MPI_INTEGER,this%cfg%comm,ierr)
+            g_nZones=sum(g_nZone_array)
+            g_nodeList_array = 3*g_nZone_array     
+            
+            ! Allocate global lists
+            allocate(g_nodeList(3*g_nZones)); g_nodeList=0
+            allocate(g_Vnorm(g_nZones)); g_Vnorm=0
+            allocate(g_xNode(g_nNodes)); g_xNode=0
+            allocate(g_yNode(g_nNodes)); g_yNode=0
+            allocate(g_zNode(g_nNodes)); g_zNode=0
+            
+            ! Compute displacements for data from each processor in global arrays
+            do n=1,this%cfg%nproc
+               displace(n)          = sum(g_nNode_array(1:n-1))
+               displace_zonelist(n) = sum(g_nZone_array(1:n-1))
+               displace_nodelist(n) = sum(g_nodeList_array(1:n-1))
+            end do
+
+            nodeList = nodeList+displace(this%cfg%rank+1)
+            !print*, xNode(1:nNodes)
+            !print*, yNode(1:nNodes)
+            !print*, zNode(1:nNodes)
+
+            ! Gather node lists onto root
+            call MPI_GATHERV(nodeList(1:3*nZones),3*nZones,MPI_INTEGER, &
+               g_nodeList,g_nodeList_array,displace_nodelist,MPI_INTEGER,root,this%cfg%comm,ierr)
+            call MPI_GATHERV(Vnorm(1:nZones),nZones,MPI_REAL,    &
+               g_Vnorm,g_nZone_array,displace_zonelist,MPI_REAL,root,this%cfg%comm,ierr)
+            call MPI_GATHERV(xNode(1:nNodes),nNodes,MPI_REAL,    &
+               g_xNode,g_nNode_array,displace,MPI_REAL,root,this%cfg%comm,ierr)
+            call MPI_GATHERV(yNode(1:nNodes),nNodes,MPI_REAL,    &
+               g_yNode,g_nNode_array,displace,MPI_REAL,root,this%cfg%comm,ierr)
+            call MPI_GATHERV(zNode(1:nNodes),nNodes,MPI_REAL,    &
+               g_zNode,g_nNode_array,displace,MPI_REAL,root,this%cfg%comm,ierr)
+            !print*, "Finished gathering lists onto root"
+            !print*, "Total number of nodes on root is ", g_nNodes
+            !print*, "Total number of zones on root is ", g_nZones
+            if (this%cfg%amRoot) then  
+               if (g_nNodes.gt.0) then  
+                  ! Update output counter
+                  ms_nout_time=ms_nout_time+1
+                  
+                  ! Create directory for SILO files created this timestep
+                  write(buffer,'(ES12.5)') this%time%t
+                  folder = 'gtda/events_'//trim(adjustl(buffer))
+                  inquire(file=folder,exist=dir_exists)
+                  if (.not.dir_exists) then
+                     call execute_command_line('mkdir -p '//trim(folder))
+                  end if 
+                  !print*, 'creating file with id ',id
+                  !print*, this%strack%struct(np)%id
+                  ! Filename is event type and new LID
+                  write(buffer,'(I7.7)') id
+
+                  select case(silo_case)
+                  case(1) ! Write file for merge event
+                     write(siloname,'(A,A,A)') trim(folder)//'/merge',trim(adjustl(buffer)),'.silo'
+                  case(2) ! Write file for split event 
+                     write(siloname,'(A,A,A)') trim(folder)//'/split',trim(adjustl(buffer)),'.silo'
+                  case(3) ! Write file for update 
+                     write(siloname,'(A,A,A)') trim(folder)//'/update',trim(adjustl(buffer)),'.silo'
+                  end select    
+                  !print*, 'wrote file'
+                  ! Create the silo database
+                  err = dbcreate(siloname, len_trim(siloname), DB_CLOBBER, DB_LOCAL,"Silo database created with NGA2", 30, DB_HDF5, dbfile)
+                     if(dbfile.eq.-1) call die('Could not create Silo file!')
+                  ! ierr = dbclose(dbfile)
+                  !print*, 'writing interface for structure: g_nZones=', g_nZones, ' g_nNodes=', g_nNodes, ' g_nodeList size=', size(g_nodeList), ' g_Vnorm size=', size(g_Vnorm)
+                  ! Write interface as unstructured mesh made of tetrahedra
+                  err = dbputzl2(dbfile,"zonelist",8,g_nZones,3,g_nodeList,3*g_nZones,1,0,0 &
+                        ,DB_ZONETYPE_TRIANGLE,3,g_nZones,1,DB_F77NULL,ierr) 
+                  !print*, 'finished writing zonelist'
+                  !print*, g_xNode(1:g_nNodes)
+                  !print*, "finished printing xnodes"
+                  !print*, g_yNode(1:g_nNodes)
+                  !print*, "finished printing ynodes"
+                  !print*, g_zNode(1:g_nNodes)
+                  !print*, "finished printing znodes"
+                  err = dbputum(dbfile,"Interface",9,3,g_xNode(1:g_nNodes),g_yNode(1:g_nNodes),g_zNode(1:g_nNodes) &
+                        ,"xInt",4,"yInt",4,"zInt",4,DB_FLOAT,g_nNodes,g_nZones,"zonelist",8,DB_F77NULL,0,DB_F77NULL,ierr)
+                  !print*, 'finished writing unstructured mesh'
+                  err = dbputuv1(dbfile,"Vnorm",5,"Interface",9,g_Vnorm(1:g_nZones),g_nZones &
+                        ,DB_F77NULL,0,DB_FLOAT,DB_ZONECENT,DB_F77NULL, ierr)
+                  !print*, 'finished writing Vnorm variable'
+                  ! Close group silo file
+                  ierr = dbclose(dbfile)
+                  !print*, 'closed file'
+               end if 
+            end if ! iroot.eq.irank 
+            ! Deallocate global lists associated with this structure
+            deallocate(g_nodeList,g_xNode,g_yNode,g_zNode,g_Vnorm)  
+         end if 
+         ! Deallocate local lists associated with this structure
+         deallocate(nodeList,xNode,yNode,zNode,Vnorm)    
+
+      end do ! np=1,nUp
+      !call timing_stop('gtda')
+      !print*, "Finished dumping GTDA for this event", "id=", id
+   end subroutine dump_gtda
+
+   ! Subroutine for keeping track of LIDs for SILO outputs
+   !subroutine silo_lists_update(this,silo_case)
+   !   !use dump_merge_split
+   !   use quicksort
+!
+   !   integer, intent(in) :: silo_case 
+   !   logical :: added = .false.
+   !   
+   !   if (this%cfg%amRoot) then 
+   !      ! Check if we need to resize array
+   !      if (nAlloc_silo-this%strack%nstruct.lt.200) then
+   !         allocate(g_tmpInt(nAlloc_silo))
+   !         allocate(g_tmpWP(nAlloc_silo))
+   !         g_tmpInt=LID_silo; deallocate(LID_silo) ; allocate(LID_silo(nAlloc_silo+1000)) ; LID_silo = 0      ; LID_silo(1:nAlloc_silo)=g_tmpInt(1:nAlloc_silo)
+   !         g_tmpWP=time_silo; deallocate(time_silo); allocate(time_silo(nAlloc_silo+1000)); time_silo = 0.0_WP; time_silo(1:nAlloc_silo)=g_tmpWP(1:nAlloc_silo)
+   !         deallocate(g_tmpInt,g_tmpWP)
+   !         nAlloc_silo = nAlloc_silo + 10
+   !      end if
+!
+   !      select case(silo_case)
+   !      case(1) ! Merge case
+   !         !g_nStruct = g_nStruct - nUp ! Update g_nStruct from last timestep
+   !         ! Remove old LIDs from list of LIDs
+   !         update: do i = 1,this%strack%nstruct
+   !            do j = 1,nAlloc_silo
+   !               if (LID_silo(j).eq.this%strack%oldids(i)) then
+   !                  LID_silo(j:this%strack%nstruct) = LID_silo(j+1:this%strack%nstruct+1)
+   !                  LID_silo(this%strack%nstruct+1) = 0
+   !                  time_silo(j:this%strack%nstruct) = time_silo(j+1:this%strack%nstruct+1) ! Shift lists up
+   !                  time_silo(this%strack%nstruct+1) = 0.0_WP
+   !                  cycle update 
+   !               end if 
+   !            end do 
+   !         end do update 
+!
+   !      case(2) ! Split case 
+   !         ! Remove old LIDs from list of LIDs
+   !         update_remove: do i = 1,this%strack%nstruct
+   !            do j = 1,nAlloc_silo
+   !               if (LID_silo(j).eq.this%strack%oldids(i)) then
+   !                  LID_silo(j:this%strack%nstruct) = LID_silo(j+1:this%strack%nstruct+1)
+   !                  LID_silo(this%strack%nstruct+1) = 0
+   !                  time_silo(j:this%strack%nstruct) = time_silo(j+1:this%strack%nstruct+1) ! Shift lists up
+   !                  time_silo(this%strack%nstruct+1) = 0.0_WP
+   !                  cycle update_remove 
+   !               end if 
+   !            end do 
+   !         end do update_remove 
+   !         ! Add new LIDs to list of LIDs  
+   !         update_add: do i = 1,this%strack%nstruct
+   !            do j = 1,nAlloc_silo
+   !               if (LID_silo(j).eq.0) then
+   !                  LID_silo(j)  = this%strack%id_rmp(i)
+   !                  time_silo(j) = time
+   !                  cycle update_add
+   !               end if 
+   !            end do 
+   !         end do update_add
+!
+   !      case(3) ! Update case
+   !         ! Update times when we call silo_lists_check
+   !         do i = 1,this%strack%nstruct
+   !            time_silo(i) = this%time%t ! update the first nUp entries
+   !         end do 
+   !         call quick_sort(time_silo(1:this%strack%nstruct),LID_silo(1:this%strack%nstruct))
+!
+   !      case(4) ! Struct removed from domain in dump_struct_remove 
+   !         ! Remove old LIDs from list of LIDs
+   !         update_remove2: do i = 1,this%strack%nstruct
+   !            do j = 1,nAlloc_silo
+   !               if (LID_silo(j).eq.up_LIDo(i)) then
+   !                  LID_silo(j:this%strack%nstruct) = LID_silo(j+1:this%strack%nstruct+1)
+   !                  LID_silo(this%strack%nstruct+1) = 0
+   !                  time_silo(j:this%strack%nstruct) = time_silo(j+1:this%strack%nstruct+1) ! Shift lists up
+   !                  time_silo(this%strack%nstruct+1) = 0.0_WP
+   !                  cycle update_remove2 
+   !               end if 
+   !            end do 
+   !         end do update_remove2 
+   !      end select
+!
+   !   end if 
+   !end subroutine silo_lists_update
+
+   !subroutine silo_list_check
+   !   use dump_merge_split
+   !   use dump_struct 
+   !   use dump_gtda 
+!
+   !   nUp = 0 ! Reset update counter
+!
+   !   deallocate(this%strack%id_rmp)
+   !   allocate(this%strack%id_rmp(this%strack%nstruct)) 
+   !   if (this%cfg%amRoot) then
+   !      do i = 1,this%strack%nstruct
+   !         if ((this%time%t - time_silo(i)) .ge. update_time) then 
+   !            !nUp = nUp + 1 
+   !            !up_LIDn(nUp) = LID_silo(i)
+   !            this%strack%id_rmp(i) = LID_silo(i)
+   !         else 
+   !            exit ! Stop if not enough time has passed
+   !         end if 
+   !      end do   
+   !   end if 
+   !   
+   !   call MPI_Bcast(nUp,1,MPI_INTEGER,iroot-1,comm,ierr)
+   !   call MPI_Bcast(this%strack%id_rmp(1:this%strack%nstruct),this%strack%nstruct,MPI_INTEGER,iroot-1,comm,ierr) 
+!
+   !   if (this%strack%nstruct.gt.0) then
+   !      ! Associate SIDs with LIDs for SILO file extraction
+   !      deallocate(this%strack%id)
+   !      allocate(this%strack%id(this%strack%nstruct)); this%strack%id=0 
+   !      update: do n=1,this%strack%nstruct     
+   !         do k=kmin_,kmax_
+   !            do j=jmin_,jmax_
+   !               do i=imin_,imax_ 
+   !                  if (nint(this%strack%id(i,j,k)).eq.this%strack%id_rmp(n)) then 
+   !                     this%strack%id(n) = this%strack%id(i,j,k) 
+   !                     cycle update 
+   !                  end if 
+   !               end do 
+   !            end do   
+   !         end do           
+   !      end do update 
+   !   end if 
+!
+   !end subroutine silo_list_check
+
    !> Initialization of ljcf simulation
    subroutine init(this)
       implicit none
       class(ljcf), intent(inout) :: this
-      
+      !> Added parameters for GTDA dumping testing
+      real(WP), dimension(3) :: center
+      real(WP) :: radius
       ! Create the ljcf mesh
       create_config: block
          use sgrid_class, only: cartesian,sgrid
@@ -470,7 +928,7 @@ contains
          use vfs_class, only: remap_storage,VFlo,VFhi,plicnet,r2pnet
          use mms_geom,  only: cube_refine_vol
          use param,     only: param_read
-         use MPI, only: MPI_INTEGER,MPI_MAX
+         use mpi_f08, only: MPI_INTEGER,MPI_MAX
          integer :: i,j,k,n,si,sj,sk,ierr
          real(WP), dimension(3,8) :: cube_vertex
          real(WP), dimension(3) :: v_cent,a_cent
@@ -563,7 +1021,100 @@ contains
          ! Reset moments to guarantee compatibility with interface reconstruction
          call this%vf%reset_volume_moments()
       end block create_and_initialize_vof
-      
+!      create_and_initialize_vof: block
+!         use vfs_class, only:lvira,plicnet,remap_storage,VFhi,VFlo,r2pnet
+!         use random, only: random_uniform
+!         use mms_geom, only: cube_refine_vol
+!         use precision, only: I4
+!         use MPI, only: MPI_INTEGER,MPI_MAX
+!         use param, only: param_read
+!         real(WP), dimension(3,8) :: cube_vertex
+!         real(WP), dimension(3) :: v_cent,a_cent
+!         real(WP) :: vol,area
+!         integer, parameter :: amr_ref_lvl=4
+!         integer :: i,j,k,n,si,sj,sk
+!         integer :: nD,nDrop
+!         integer(kind=I4), allocatable, dimension(:) :: seed
+!         integer(kind=I4) :: nseed
+!         integer :: ierr
+!         ! Create a VOF solver with r2p reconstruction
+!         call this%vf%initialize(cfg=this%cfg,reconstruction_method=lvira,transport_method=remap_storage,name='VOF')
+!         ! Create structure tracker
+!         this%vf%thin_thld_min=0.0_WP
+!         this%vf%flotsam_thld=0.0_WP
+!         this%vf%maxcurv_times_mesh=1.0_WP
+!         call this%strack%initialize(vf=this%vf,phase=0,make_label=label_liquid,name='stracker_test')
+!         ! Initialize our bubble via r2p planes
+!         call param_read('Droplet diameter',radius); radius=radius/2.0_WP
+!         call param_read('Number of droplet',nDrop);
+!         ! Provide seed for random number generator
+!         call random_seed(size=nseed)
+!         allocate(seed(nseed))
+!         seed(:)=1
+!         call random_seed(put=seed)
+!         do nD=1,nDrop
+!            center=[random_uniform(this%vf%cfg%x(this%vf%cfg%imin),this%vf%cfg%x(this%vf%cfg%imax+1)), &
+!                    random_uniform(this%vf%cfg%y(this%vf%cfg%jmin),this%vf%cfg%y(this%vf%cfg%jmax+1)), &
+!                    random_uniform(this%vf%cfg%z(this%vf%cfg%kmin),this%vf%cfg%z(this%vf%cfg%kmax+1))  ]
+!                     
+!            do k=this%vf%cfg%kmino_,this%vf%cfg%kmaxo_
+!               do j=this%vf%cfg%jmino_,this%vf%cfg%jmaxo_
+!                  do i=this%vf%cfg%imino_,this%vf%cfg%imaxo_
+!                     ! Set cube vertices
+!                     n=0
+!                     do sk=0,1
+!                        do sj=0,1
+!                           do si=0,1
+!                              n=n+1; cube_vertex(:,n)=[this%vf%cfg%x(i+si),this%vf%cfg%y(j+sj),this%vf%cfg%z(k+sk)]
+!                           end do
+!                        end do
+!                     end do
+!                     ! Call adaptive refinement code to get volume and barycenters recursively
+!                     vol=0.0_WP; area=0.0_WP; v_cent=0.0_WP; a_cent=0.0_WP
+!                     !!!!! levelset_sphere
+!                     call cube_refine_vol(cube_vertex,vol,area,v_cent,a_cent,levelset_sphere,0.0_WP,amr_ref_lvl)
+!                     this%vf%VF(i,j,k)=min(1.0_WP,this%vf%VF(i,j,k)+vol/this%vf%cfg%vol(i,j,k))
+!                     if (this%vf%VF(i,j,k).ge.VFlo.and.this%vf%VF(i,j,k).le.VFhi) then
+!                        this%vf%Lbary(:,i,j,k)=v_cent
+!                        this%vf%Gbary(:,i,j,k)=([this%vf%cfg%xm(i),this%vf%cfg%ym(j),this%vf%cfg%zm(k)]-this%vf%VF(i,j,k)*this%vf%Lbary(:,i,j,k))/(1.0_WP-this%vf%VF(i,j,k))
+!                     else
+!                        this%vf%Lbary(:,i,j,k)=[this%vf%cfg%xm(i),this%vf%cfg%ym(j),this%vf%cfg%zm(k)]
+!                        this%vf%Gbary(:,i,j,k)=[this%vf%cfg%xm(i),this%vf%cfg%ym(j),this%vf%cfg%zm(k)]
+!                     end if
+!                     ! Set stracker id
+!                     if (vol.gt.0.0_WP) then
+!                        this%strack%id(i,j,k)=1
+!                        !if (nD.eq.4) then    ! Test growth (merge2)
+!                        !   strack%id(i,j,k)=0
+!                        !end if   
+!                     end if
+!                  end do
+!               end do
+!            end do
+!         end do
+!         call this%vf%cfg%sync(this%vf%VF)
+!         call this%vf%cfg%sync(this%strack%id)
+!
+!         ! Initialize id counter to be consistent with id's
+!         this%strack%idcount=maxval(this%strack%id)
+!         call MPI_ALLREDUCE(maxval(this%strack%id),this%strack%idcount,1,MPI_INTEGER,MPI_MAX,this%vf%cfg%comm,ierr)
+!         ! Update the band
+!         call this%vf%update_band()
+!         ! Perform interface reconstruction from VOF field
+!         call this%vf%build_interface()
+!         ! Set interface planes at the boundaries
+!         call this%vf%set_full_bcond()
+!         ! Create discontinuous polygon mesh from IRL interface
+!         call this%vf%polygonalize_interface()
+!         ! Calculate distance from polygons
+!         call this%vf%distance_from_polygon()
+!         ! Calculate subcell phasic volumes
+!         call this%vf%subcell_vol()
+!         ! Calculate curvature
+!         call this%vf%get_curvature()
+!         ! Reset moments to guarantee compatibility with interface reconstruction
+!         call this%vf%reset_volume_moments()
+!      end block create_and_initialize_vof
       
       ! Create an iterator for removing VOF at edges
       create_iterator: block
@@ -841,18 +1392,86 @@ contains
       end block create_timing
 
       create_merge_split: block 
-         integer :: iunit
+         integer :: i,ierr,iunit,nchar
          logical :: file_exists
+         character(len=5)  :: tmpchar
+         character(len=60) :: tmpchar2
+         character(len=22) :: buffer
+         real(WP) :: current_time
+         logical :: LID_silo_exists
+         integer :: nAlloc_silo, ms_nout_time 
+         real(WP),dimension(:),allocatable :: ms_times,time_silo
+         real(WP) :: update_time
+         !character(len=str_medium) :: gtda_output_type ! Default or Marching cubes 
+         integer,dimension(:),allocatable :: LID_silo  
+
+         LID_silo_exists = .false.
+
+         !call create_timing('gtda')
+
+         !call param_read('Silo update frequency',update_time,max_dt*10)
+         !call param_read('Gtda output type', gtda_output_type,'Marching cubes')
+
          if (this%cfg%amRoot) then
             ! Check if the file exists
             INQUIRE(FILE="merge_split.csv", EXIST=file_exists)
+            print*, "Checking for merge_split.csv file for GTDA output. File exists: ", file_exists
             if (.not.file_exists) then
                ! Create a new file with headers if it doesn't exist
                open(newunit=iunit, file="merge_split.csv", form="formatted", status="replace", action="write")
                write(iunit, "(A)") "Event Count, Event Type, Old IDs, New ID, Time, New Vol, X, Y, Z, U, V, W, L1, L2, L3"
                close(iunit)
             end if
+            ! Check for gtda folder
+            inquire(file="gtda/events",exist=file_exists)
+            if (file_exists) then
+               ! Get number of lines in file
+               open(newunit=iunit,file="gtda/events",form="formatted",iostat=ierr,status='old')
+               ms_nout_time=0
+               do
+                  read(iunit,*,end=1)
+                  ms_nout_time=ms_nout_time+1
+               end do
+         1       continue
+               close(iunit)
+               ! Read the file and keep times less than current time
+               allocate(ms_times(ms_nout_time))
+               open(newunit=iunit,file="gtda/events",form="formatted",iostat=ierr,status='old')
+               ! Get current time (formatted correctly)
+               write(buffer,'(ES12.5)') this%time%t-this%time%dt*1e-10_WP
+               read(buffer,*) this%time%t
+               !read(buffer,*) current_time
+               do i=1,ms_nout_time
+                  ! Read file
+                  read(iunit,'(5A,60A)') tmpchar,tmpchar2
+                  ! Extract time from string
+                  nchar=len_trim(tmpchar2)
+                  read(tmpchar2(1:nchar-11),*) ms_times(i)
+                  ! Check if it is in the future and exit if true
+                  !if (ms_times(i).ge.current_time) then
+                  if (ms_times(i).ge.this%time%t) then
+                     ms_nout_time=i-1
+                     exit
+                  end if
+               end do
+               close(iunit)
+               ! Write new file with only past times
+               open(newunit=iunit,file="gtda/events",form="formatted",iostat=ierr,status='replace')
+               do i=1,ms_nout_time
+                  write(tmpchar2,'(ES12.5)') ms_times(i)
+                  tmpchar2='time_'//trim(adjustl(tmpchar2))//'/Visit.silo'
+                  write(iunit,'(A)') trim(adjustl(tmpchar2))
+               end do
+               deallocate(ms_times)
+               close(iunit)
+            else
+               print*, "GTDA output folder not found, creating folder and skipping event read/write"
+               call execute_command_line('mkdir -p gtda')
+            end if
+
          end if
+
+         
       end block create_merge_split
 
       ! Initialize an event for drop size analysis
@@ -955,6 +1574,14 @@ contains
             label_liquid=.false.
          end if
       end function label_liquid
+
+      function levelset_sphere(xyz,t) result(G)
+         implicit none
+         real(WP), dimension(3),intent(in) :: xyz
+         real(WP), intent(in) :: t
+         real(WP) :: G
+         G=radius-sqrt(sum((xyz-center)**2))
+      end function levelset_sphere
 
    end subroutine init
    
@@ -1102,6 +1729,7 @@ contains
          end do
          call MPI_ALLREDUCE(MPI_IN_PLACE,this%vof_removed,1,MPI_REAL_WP,MPI_SUM,this%cfg%comm,ierr)
          call this%vf%clean_irl_and_band()
+         !call silo_lists_update(4)
       end block remove_vof
       
       ! Output to ensight

@@ -1,0 +1,8 @@
+# Add appropriate SILO includes and libraries
+ifdef SILO_DIR
+  INCLUDE_LOCATIONS += $(SILO_DIR)/include
+  LIBRARY_LOCATIONS += $(SILO_DIR)/lib $(HDF5_DIR)/lib $(SZIP_DIR)/lib
+  LIBRARIES += -lsiloh5 -lhdf5 -lsz
+else
+  $(error SILO_DIR not defined, but it is currently required by NGA2)
+endif

@@ -40,8 +40,8 @@ ifeq ($(DEBUG),TRUE)
   CXXFLAGS += -Og -fno-inline -ggdb -Wshadow -Wall -Wno-sign-compare -ftrapv -Wno-unused-but-set-variable
   CFLAGS   += -Og -fno-inline -ggdb -Wshadow -Wall -Wno-sign-compare -ftrapv
 
-  FFLAGS   += -Og -ggdb -pedantic -fcheck=all -fbacktrace -Wall -Wuninitialized -Wunused -ffpe-trap=invalid,zero -finit-real=snan -finit-integer=2147483647 -ftrapv
-  F90FLAGS += -Og -ggdb -pedantic -fcheck=all -fbacktrace -Wall -Wuninitialized -Wunused -ffpe-trap=invalid,zero -finit-real=snan -finit-integer=2147483647 -ftrapv
+  FFLAGS   += -Og -ggdb -fcheck=all -fbacktrace -Wall -Wuninitialized -Wunused -ffpe-trap=invalid,zero -finit-real=snan -finit-integer=2147483647 -ftrapv
+  F90FLAGS += -Og -ggdb -fcheck=all -fbacktrace -Wall -Wuninitialized -Wunused -ffpe-trap=invalid,zero -finit-real=snan -finit-integer=2147483647 -ftrapv
 
   ifneq ($(gcc_major_version),$(filter $(gcc_major_version),4 5))
     CXXFLAGS += -Wnull-dereference
@@ -76,8 +76,8 @@ else ifeq ($(gcc_major_version),5)
 endif
 CFLAGS     += -std=gnu99
 
-FFLAGS   += -ffixed-line-length-none -fno-range-check -fno-second-underscore -J$(fmoddir) -I $(fmoddir)
-F90FLAGS += -ffree-line-length-none -fno-range-check -fno-second-underscore -J$(fmoddir) -I $(fmoddir) -fimplicit-none
+FFLAGS   += -ffixed-line-length-none -fno-range-check -fno-second-underscore -fallow-argument-mismatch -J$(fmoddir) -I $(fmoddir)
+F90FLAGS += -ffree-line-length-none -fno-range-check -fno-second-underscore -fallow-argument-mismatch -J$(fmoddir) -I $(fmoddir) -fimplicit-none
 
 ########################################################################
 

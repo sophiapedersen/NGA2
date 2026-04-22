@@ -249,6 +249,10 @@ ifeq ($(USE_HYPRE),TRUE)
   $(info Loading $(NGA_HOME)/tools/GNUMake/packages/Make.hypre...)
   include        $(NGA_HOME)/tools/GNUMake/packages/Make.hypre
 endif
+ifeq ($(USE_SILO),TRUE)
+  $(info Loading $(NGA_HOME)/tools/GNUMake/packages/Make.silo...)
+  include        $(NGA_HOME)/tools/GNUMake/packages/Make.silo
+endif
 ifeq ($(USE_LAPACK),TRUE)
   $(info Loading $(NGA_HOME)/tools/GNUMake/packages/Make.lapack...)
   include        $(NGA_HOME)/tools/GNUMake/packages/Make.lapack
