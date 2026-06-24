@@ -1,16 +1,16 @@
-# NGA location
+# NGA location if not yet defined
 NGA_HOME ?= ../..
 
 # Compilation parameters
 PRECISION = DOUBLE
 USE_MPI   = TRUE
-USE_FFTW  = FALSE
+use_FFTW  = FALSE
 USE_HYPRE = TRUE
-USE_LAPACK= FALSE
+USE_LAPACK= TRUE
 USE_AMREX = TRUE
 USE_HDF5  = TRUE
 PROFILE   = FALSE
-DEBUG     = FALSE
+DEBUG     = TRUE 
 COMP      = gnu
 EXEBASE   = nga2
 
@@ -28,7 +28,7 @@ VPATH_LOCATIONS   += $(Ulocs)
 include $(NGA_HOME)/tools/GNUMake/Make.defs
 
 # Include NGA base code
-Bdirs   := amrbase amrmpsolvers thermo libraries core
+Bdirs   := amrbase amrmpsolvers libraries core
 Bpack   += $(foreach dir, $(Bdirs), $(NGA_HOME)/src/$(dir)/Make.package)
 include $(Bpack)
 
