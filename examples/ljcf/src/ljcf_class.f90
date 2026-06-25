@@ -1578,7 +1578,7 @@ contains
       logical function label_liquid(i,j,k)
          implicit none
          integer, intent(in) :: i,j,k
-         if (this%vf%VF(i,j,k).gt.0.0_WP) then
+         if (this%vf%VF(i,j,k).gt.0.00001_WP) then
             label_liquid=.true.
          else
             label_liquid=.false.
@@ -1861,7 +1861,7 @@ contains
       logical function label_liquid(i,j,k)
          implicit none
          integer, intent(in) :: i,j,k
-         if (this%vf%VF(i,j,k).gt.0.0_WP) then
+         if (this%vf%VF(i,j,k).gt.0.00001_WP) then
             label_liquid=.true.
          else
             label_liquid=.false.
