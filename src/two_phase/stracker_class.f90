@@ -444,7 +444,10 @@ contains
             ! Deal with structure not part of existing merge event
             if (this%newid2(n).eq.0) then 
                ! Check if this event contains 0, 1, or 2 new ids from id_rmp merges
-               if (this%merge2(1,n).le.old_idcount.and.this%merge2(2,n).le.old_idcount) then ! No newids
+               if (this%track_core.and.(this%merge2(1,n).eq.1.or.this%merge2(2,n).eq.1)) then ! if one of the structures is the core
+                  this%newid2(n) = 1
+                  call add_merge_master(this%merge2(1,n),this%merge2(2,n),this%newid2(n))
+               elseif (this%merge2(1,n).le.old_idcount.and.this%merge2(2,n).le.old_idcount) then ! No newids
                   ! Generate new id for merge
                   this%newid2(n) = this%generate_new_id()
                   ! Add merge to merge_master list and collapse subsequent merges
